@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
 from . import db
+from .blame import RevisionSnapshot, blame_snapshots
 from .config import settings
 from .diff import OPS, snapshot_diff
 from .guards import check_guards
@@ -45,10 +46,11 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.6.0",
+    version="1.7.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
     "支持任意两修订间的递归差异审计；"
+    "支持目标快照逐叶子的历史字段归因（blame）；"
     "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）；"
     "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）；"
     "支持文档级临时写入租约（fencing token 全局严格递增，过期后旧 token 永久失效）。",
@@ -534,6 +536,58 @@ def diff_revisions(
         "to_revision": to_revision,
         "changes": changes,
         "counts": {**counts, "total": len(changes)},
+    }
+
+
+# ---------------------------------------------------------------- 历史字段归因（blame）
+
+
+@app.get("/documents/{doc_id}/blame", tags=["documents"])
+def blame_document(
+    doc_id: str,
+    revision: int = Query(..., ge=1, description="目标快照的修订号"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """历史字段归因：目标快照中每个叶子值最后一次被改动的修订（只读）。
+
+    * 在**同一 SQLite 读事务快照**内按修订升序取出 1..目标修订并逐对比较
+      相邻快照：对象递归到叶子，数组 / 标量整体视为叶子；
+    * 每项给出 RFC 6901 ``path``、目标快照中的 ``value``、
+      ``last_changed_revision``、``author``、``request_id`` 与 ``created_at``；
+    * 路径删除后再次出现（即使值与删除前相同）归属于**重建它的修订**；
+    * 结果按 ``path`` 稳定排序；文档不存在 → 404 ``not_found``，
+      目标修订不存在 → 404 ``revision_not_found``；
+    * 纯读接口，不写入任何数据。
+    """
+    # 存在性检查与快照读取必须在同一只读事务快照内完成，
+    # 并发 PATCH 不会让“检查时存在的修订”在读取时消失或串号。
+    with db.read_transaction(conn):
+        if db.get_document(conn, doc_id) is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        target_row = db.get_revision(conn, doc_id, revision)
+        if target_row is None:
+            raise err(
+                status.HTTP_404_NOT_FOUND,
+                "revision_not_found",
+                document_id=doc_id,
+                revision=revision,
+            )
+        rows = db.list_revision_contents(conn, doc_id, revision)
+
+    snapshots = [
+        RevisionSnapshot(
+            revision=row["revision"],
+            content=json.loads(row["content"]),
+            author=row["author"],
+            request_id=row["request_id"],
+            created_at=row["created_at"],
+        )
+        for row in rows
+    ]
+    return {
+        "document_id": doc_id,
+        "revision": revision,
+        "items": blame_snapshots(snapshots),
     }
 
 

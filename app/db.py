@@ -175,6 +175,24 @@ def list_revisions(
     ).fetchall()
 
 
+def list_revision_contents(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    through_revision: int,
+) -> list[sqlite3.Row]:
+    """按修订升序返回 1..*through_revision* 的快照行（含 content 与归因元数据）。
+
+    只读、单语句；调用方需先确认 1..*through_revision* 的修订均存在。
+    """
+    return conn.execute(
+        """SELECT revision, content, author, request_id, created_at
+           FROM revisions
+           WHERE document_id = ? AND revision <= ?
+           ORDER BY revision ASC""",
+        (doc_id, through_revision),
+    ).fetchall()
+
+
 def get_request(
     conn: sqlite3.Connection, doc_id: str, request_id: str
 ) -> Optional[sqlite3.Row]:
