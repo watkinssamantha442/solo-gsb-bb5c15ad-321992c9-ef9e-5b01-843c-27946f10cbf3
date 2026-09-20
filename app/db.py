@@ -175,6 +175,19 @@ def list_revisions(
     ).fetchall()
 
 
+def list_revisions_through(
+    conn: sqlite3.Connection, doc_id: str, revision: int
+) -> list[sqlite3.Row]:
+    """按修订顺序返回 1..revision 的全部修订（含内容与归因元数据，只读）。"""
+    return conn.execute(
+        """SELECT revision, content, request_id, author, created_at
+           FROM revisions
+           WHERE document_id = ? AND revision <= ?
+           ORDER BY revision ASC""",
+        (doc_id, revision),
+    ).fetchall()
+
+
 def get_request(
     conn: sqlite3.Connection, doc_id: str, request_id: str
 ) -> Optional[sqlite3.Row]:

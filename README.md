@@ -65,6 +65,13 @@
 每项同时给出 `before` / `after`，并用 `missing` 区分键缺失与真实 `null`，数组作为整体值比较；
 任一修订不存在返回 `404` 并指出缺失修订，响应附各操作计数，空差异返回空数组。
 
+需要追溯每个字段"最后是谁改的"时，可用 **`GET /documents/{id}/blame?revision=` 历史字段归因**：
+服务端在**同一个 SQLite 读事务**内从修订 1 起按修订顺序比较相邻快照，
+对目标快照中的每个叶子值给出 `path`（RFC 6901）、`value`、`last_changed_revision`、
+`author`、`request_id` 与 `created_at`；对象递归到叶子，数组整体视为叶子；
+路径删除后再次出现时归属于**重建它**的修订，即使值与删除前相同；
+结果按 `path` 稳定排序，目标修订不存在返回 `404`，查询不产生任何写入。
+
 配置被拆分到多个文档、需要拼装成一份完整视图时，可用
 **`GET /documents/{id}/resolved?revision=` 跨文档引用解析**：
 文档中**仅含 `$ref` 键**且值形如 `doc:<ID>@<正整数|current>#<RFC6901指针>` 的对象
@@ -133,6 +140,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
 | `GET` | `/documents/{id}/diff` | 比较两个修订快照（`from_revision`/`to_revision`），返回按 RFC 6901 路径排序的 add/remove/replace 差异 |
+| `GET` | `/documents/{id}/blame` | 历史字段归因（`revision` 指定目标快照）：每个叶子值最后由哪次修订改变 |
 | `GET` | `/documents/{id}/resolved` | 跨文档引用解析（`revision` 可选，默认 `current`），返回 `resolved` 与去重依赖清单 |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
@@ -660,6 +668,63 @@ curl 'http://localhost:8000/documents/demo/diff?from_revision=1&to_revision=3'
     "from_revision": 1, "to_revision": 99, "missing_revisions": [99]}}
   ```
 
+## 历史字段归因（GET /documents/{id}/blame）
+
+只读接口：回答"目标快照里每个叶子值**最后是由哪次修订**改成现在这样的"。
+服务端在**同一个 SQLite 读事务**（WAL 快照读，不阻塞并发写入）内从修订 1 起
+按修订顺序比较相邻快照，把每个叶子路径归属到它最后一次发生变化的修订；
+查询不产生任何写入。
+
+```bash
+# 历史：rev1 alice 创建 {"a":1,"b":2,"c":{"x":1},"tags":["u"]}
+#       → rev2 bob 改 a=100（request_id: req-001）
+#       → rev3 carol 删 b、tags 追加 "v"（request_id: req-002）
+curl 'http://localhost:8000/documents/demo/blame?revision=3'
+```
+
+```json
+{
+  "document_id": "demo",
+  "revision": 3,
+  "entries": [
+    {"path": "/a",     "value": 100,       "last_changed_revision": 2,
+     "author": "bob",   "request_id": "req-001", "created_at": "2026-09-20T08:00:01.000000Z"},
+    {"path": "/c/x",   "value": 1,         "last_changed_revision": 1,
+     "author": "alice", "request_id": null,      "created_at": "2026-09-20T08:00:00.000000Z"},
+    {"path": "/tags",  "value": ["u", "v"], "last_changed_revision": 3,
+     "author": "carol", "request_id": "req-002", "created_at": "2026-09-20T08:00:02.000000Z"}
+  ]
+}
+```
+
+归因项字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `path` | 叶子位置的 RFC 6901 JSON Pointer，根为 `""`，键中的 `~`/`/` 转义为 `~0`/`~1` |
+| `value` | 目标快照在该路径的叶子值 |
+| `last_changed_revision` | 该叶子最后一次发生变化（含出现 / 重建）的修订号 |
+| `author` / `request_id` / `created_at` | 该修订落库时的作者、去重 ID 与时间（修订 1 为创建快照，`request_id` 为 `null`；发布产生的修订 `request_id` 为 `release_id`） |
+
+语义要点：
+
+- **叶子定义**：对象按键递归到叶子；**数组 / 标量 / `null` 整体视为叶子**
+  （不按下标展开，与 RFC 7386 整体替换语义一致）；空对象没有可递归的子键，
+  本身作为叶子（值 `{}`）；
+- **删除后重建**：路径消失后其归属即被丢弃，之后再次出现时归属于**重建它**的
+  修订——即使值与删除前完全相同（如上例中若 `b` 被删后又以原值 `2` 重建，
+  `/b` 归属于重建修订而非修订 1）；
+- 值比较用确定性序列化：`1` / `1.0` / `true` 这类落库字节不同的值视为不同，
+  变化即重新归属；
+- 归因按**快照内容**而非补丁：三方重放、撤销、原子发布产生的修订同样按
+  其最终内容参与归属；
+- 结果按 `path` 稳定排序；`revision` 必须是正整数（缺失或非法 → `422`）；
+- 文档不存在 → `404 not_found`；目标修订不存在 → `404 revision_not_found`：
+
+  ```json
+  {"detail": {"error": "revision_not_found", "document_id": "demo", "revision": 99}}
+  ```
+
 ## 跨文档引用解析（GET /documents/{id}/resolved）
 
 只读接口：把分散在多个文档中的配置按 `$ref` 引用拼装成一份完整视图。
@@ -883,7 +948,7 @@ HTTP/1.1 422 Unprocessable Entity
 | `404 not_found` | 文档不存在（契约接口同理） |
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
 | `404 lease_not_found` | 文档当前没有租约（查询 / 续期） |
-| `404 revision_not_found` | 指定修订不存在（单修订查询 / 差异审计，`missing_revisions` 指出缺失修订） |
+| `404 revision_not_found` | 指定修订不存在（单修订查询 / 差异审计 / 字段归因，差异审计以 `missing_revisions` 指出缺失修订） |
 | `409 conflict` | 三方合并存在分歧路径（原子发布单项失败时聚合在 `failures` 中） |
 | `409 lease_conflict` | 写入被未过期租约拒绝、携带失效 lease_token、或租约获取 / 续期 / 释放凭证不匹配（不写修订、不占用 request_id / release_id） |
 | `409 precondition_failed` | guards 前置条件未满足（`failures` 列出 expected/actual 与缺失侧；不写修订、不占用 request_id） |
@@ -908,10 +973,11 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、引用解析）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、字段归因、引用解析）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── guards.py      # 更新前置条件求值（RFC 6901 指针 + 等值/缺失检查，无框架依赖，可单测）
 │   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
+│   ├── blame.py       # 历史字段归因（叶子值最后变更归属，无框架依赖，可单测）
 │   ├── resolve.py     # 跨文档 $ref 引用递归解析（环检测、深度上限，无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
 │   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约/发布/租约表读写、读写事务
@@ -924,6 +990,7 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_reverts.py   # POST /documents/{id}/reverts 撤销集成测试（25 例）
 │   ├── test_releases.py  # POST /releases 原子发布集成测试（17 例）
 │   ├── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
+│   ├── test_blame.py     # GET /documents/{id}/blame 历史字段归因集成测试（24 例）
 │   ├── test_resolve.py   # GET /documents/{id}/resolved 引用解析集成测试（33 例）
 │   ├── test_guards.py    # guards 前置条件与发布项 guards 集成测试（27 例）
 │   └── test_leases.py    # 写入租约（获取/续期/释放/查询 + PATCH/发布门禁）集成测试（29 例）
